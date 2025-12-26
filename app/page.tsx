@@ -6,6 +6,9 @@ type Point = { x: number; y: number };
 type Stroke = { color: string; sizeNorm: number; points: Point[] };
 
 export default function Home() {
+  const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+  const withBasePath = (p: string) => `${basePath}${p.startsWith("/") ? p : `/${p}`}`;
+
   const inputRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -199,7 +202,7 @@ export default function Home() {
       const meta = { width: img.naturalWidth, height: img.naturalHeight };
       setStencilMeta(meta);
     };
-    img.src = "/images/stealie.png";
+    img.src = withBasePath("/images/stealie.png");
   }, []);
 
   // Stage is fixed to stencil's natural pixel size: no window resize handlers.
@@ -607,7 +610,7 @@ export default function Home() {
 
                 {/* Stencil overlay */}
                 <img
-                  src="/images/stealie.png"
+                  src={withBasePath("/images/stealie.png")}
                   alt="Stealie stencil"
                   className="pointer-events-none absolute inset-0 h-full w-full select-none object-contain"
                   draggable={false}
