@@ -6,8 +6,16 @@ type Point = { x: number; y: number };
 type Stroke = { color: string; sizeNorm: number; points: Point[] };
 
 export default function Home() {
+  // Get basePath - Next.js sets NEXT_PUBLIC_BASE_PATH at build time
+  // For static exports with basePath, we need to manually add it to asset paths
   const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
-  const withBasePath = (p: string) => `${basePath}${p.startsWith("/") ? p : `/${p}`}`;
+  const withBasePath = (p: string) => {
+    if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:") || p.startsWith("blob:")) {
+      return p;
+    }
+    const cleanPath = p.startsWith("/") ? p : `/${p}`;
+    return basePath ? `${basePath}${cleanPath}` : cleanPath;
+  };
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -197,13 +205,21 @@ export default function Home() {
   useEffect(() => {
     const img = new Image();
     img.decoding = "async";
+    const stencilPath = withBasePath("/images/stealie.png");
     img.onload = () => {
       stencilRef.current = img;
       const meta = { width: img.naturalWidth, height: img.naturalHeight };
       setStencilMeta(meta);
     };
-    img.src = withBasePath("/images/stealie.png");
-  }, []);
+    img.onerror = (e) => {
+      console.error("Failed to load stencil image. Path:", stencilPath, "Error:", e);
+      // Try to help debug - log the actual basePath value
+      console.error("basePath value:", basePath);
+      console.error("NEXT_PUBLIC_BASE_PATH:", process.env.NEXT_PUBLIC_BASE_PATH);
+    };
+    img.src = stencilPath;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // basePath is constant from env var, so empty deps is fine
 
   // Stage is fixed to stencil's natural pixel size: no window resize handlers.
 
