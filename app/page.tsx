@@ -374,7 +374,7 @@ export default function Home() {
         <div className="flex w-full max-w-3xl flex-col items-center gap-4">
           {imageUrl ? (
             <div className="w-full">
-              <div className="mx-auto grid h-12 w-full max-w-3xl grid-cols-[auto_1fr_auto] items-center gap-3 rounded-full px-2 text-sm text-black/80">
+              <div className="mx-auto flex w-full max-w-3xl flex-col gap-3 rounded-full px-2 py-2 text-sm text-black/80 md:grid md:h-12 md:grid-cols-[auto_1fr_auto] md:items-center md:py-0">
                 {/* Fixed position toggle */}
                 <div className="flex items-center rounded-full ring-1 ring-black/20">
                   <button
@@ -404,7 +404,7 @@ export default function Home() {
                 </div>
 
                 {/* Fixed-height, non-jittering mode controls */}
-                <div className="relative h-full min-w-0">
+                <div className="relative min-h-12 min-w-0 md:h-full">
                   <div
                     className={[
                       "absolute inset-0 flex items-center justify-center gap-3 transition-opacity",
