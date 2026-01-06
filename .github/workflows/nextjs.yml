@@ -61,6 +61,12 @@ jobs:
           #
           # You may remove this line if you want to manage the configuration yourself.
           static_site_generator: next
+      - name: Set NEXT_PUBLIC_BASE_PATH
+        # GitHub Actions injects basePath into next.config, but we also need NEXT_PUBLIC_BASE_PATH
+        # Extract it from the repository name (GitHub Pages uses /repo-name as basePath)
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          echo "NEXT_PUBLIC_BASE_PATH=/$REPO_NAME" >> $GITHUB_ENV
       - name: Restore cache
         uses: actions/cache@v4
         with:
