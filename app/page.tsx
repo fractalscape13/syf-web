@@ -531,16 +531,65 @@ export default function Home() {
       ctx.restore();
     }
 
-    exportCanvas.toBlob((blob) => {
-      if (!blob) return;
+    // Helper function to detect if device is mobile
+    function isMobileDevice(): boolean {
+      // Check for touch support and screen width
+      const hasTouchScreen = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+      const isSmallScreen = window.innerWidth <= 768;
+      
+      // Check user agent for mobile patterns
+      const userAgent = navigator.userAgent || navigator.vendor || '';
+      const mobileRegex = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i;
+      const isMobileUserAgent = mobileRegex.test(userAgent);
+      
+      return (hasTouchScreen && isSmallScreen) || isMobileUserAgent;
+    }
+
+    // Helper function to download image (fallback when Web Share API is not available)
+    function downloadImage(blob: Blob) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "image.png";
+      a.download = "stealie-image.png";
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+    }
+
+    exportCanvas.toBlob((blob) => {
+      if (!blob) return;
+      
+      // Only use Web Share API on mobile devices
+      const isMobile = isMobileDevice();
+      
+      if (isMobile && navigator.share && navigator.canShare) {
+        // Convert blob to File for Web Share API
+        const file = new File([blob], "stealie-image.png", { type: "image/png" });
+        
+        // Try Web Share API on mobile (allows "Save to Photos" option)
+        if (navigator.canShare({ files: [file] })) {
+          navigator.share({
+            files: [file],
+            title: "Stealie",
+            text: "Check out my stealie!",
+          })
+            .then(() => {
+              // Share successful - user chose an option from share sheet
+            })
+            .catch((error) => {
+              // User cancelled or share failed - fall back to download
+              if (error.name !== "AbortError") {
+                // Only fall back if it wasn't a user cancellation
+                downloadImage(blob);
+              }
+            });
+          return;
+        }
+      }
+      
+      // Desktop or Web Share API not available - use download
+      downloadImage(blob);
     }, "image/png");
   }
 
