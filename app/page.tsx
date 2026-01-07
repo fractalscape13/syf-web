@@ -37,6 +37,9 @@ export default function Home() {
     startMidY: number;
     startDist: number;
   } | null>(null);
+  const redrawRequestRef = useRef<number | null>(null);
+  const transformUpdateRequestRef = useRef<number | null>(null);
+  const pendingTransformRef = useRef<{ scale: number; offsetX: number; offsetY: number } | null>(null);
 
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [imageMeta, setImageMeta] = useState<{
@@ -65,14 +68,30 @@ export default function Home() {
     offsetX: number;
     offsetY: number;
   }>({ scale: 1, offsetX: 0, offsetY: 0 });
+  const [mounted, setMounted] = useState(false);
 
   const maxCanvasWidthPx = 960;
   const canvasSidePaddingPx = 48; // px-6 both sides
+
+  // Ensure component is mounted before rendering browser-dependent content
+  useEffect(() => {
+    setMounted(true);
+  }, []);
 
   useEffect(() => {
     return () => {
       if (imageUrl) URL.revokeObjectURL(imageUrl);
       if (processedStencilUrl) URL.revokeObjectURL(processedStencilUrl);
+      // Cleanup pending redraw request
+      if (redrawRequestRef.current !== null) {
+        cancelAnimationFrame(redrawRequestRef.current);
+        redrawRequestRef.current = null;
+      }
+      // Cleanup pending transform update request
+      if (transformUpdateRequestRef.current !== null) {
+        cancelAnimationFrame(transformUpdateRequestRef.current);
+        transformUpdateRequestRef.current = null;
+      }
     };
   }, [imageUrl, processedStencilUrl]);
 
@@ -140,66 +159,116 @@ export default function Home() {
   }
 
   function redraw() {
+    // Cancel any pending redraw
+    if (redrawRequestRef.current !== null) {
+      cancelAnimationFrame(redrawRequestRef.current);
+      redrawRequestRef.current = null;
+    }
+    
     const canvas = canvasRef.current;
     const img = imageRef.current;
     const size = stageSize;
     if (!canvas || !size) return;
+    
+    // Guard: ensure size is valid
+    if (size.w <= 0 || size.h <= 0 || !Number.isFinite(size.w) || !Number.isFinite(size.h)) {
+      return;
+    }
 
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    const canvasWidth = Math.floor(size.w * dpr);
+    const canvasHeight = Math.floor(size.h * dpr);
+    
+    // Guard: ensure canvas dimensions are valid
+    if (canvasWidth <= 0 || canvasHeight <= 0 || !Number.isFinite(canvasWidth) || !Number.isFinite(canvasHeight)) {
+      return;
+    }
+    
     if (
-      canvas.width !== Math.floor(size.w * dpr) ||
-      canvas.height !== Math.floor(size.h * dpr)
+      canvas.width !== canvasWidth ||
+      canvas.height !== canvasHeight
     ) {
-      canvas.width = Math.floor(size.w * dpr);
-      canvas.height = Math.floor(size.h * dpr);
+      canvas.width = canvasWidth;
+      canvas.height = canvasHeight;
       // Visual sizing is handled by the wrapper (w/h) + CSS (w-full/h-full).
     }
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Reset transform and clear
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    
-    // Draw background first (before any transforms)
-    if (exportBackgroundType === "color") {
-      ctx.fillStyle = exportBackgroundColor;
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-    } else {
-      // Transparent - draw checkerboard pattern to indicate transparency
-      // Draw checkerboard at device pixel resolution
-      const tileSize = 12 * dpr;
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#e5e5e5";
-      for (let y = 0; y < canvas.height; y += tileSize) {
-        for (let x = 0; x < canvas.width; x += tileSize) {
-          if ((x / tileSize + y / tileSize) % 2 === 0) {
-            ctx.fillRect(x, y, tileSize, tileSize);
+    try {
+      // Reset transform and clear
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      
+      // Draw background first (before any transforms)
+      if (exportBackgroundType === "color") {
+        ctx.fillStyle = exportBackgroundColor;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      } else {
+        // Transparent - draw checkerboard pattern to indicate transparency
+        // Draw checkerboard at device pixel resolution
+        const tileSize = 12 * dpr;
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#e5e5e5";
+        for (let y = 0; y < canvas.height; y += tileSize) {
+          for (let x = 0; x < canvas.width; x += tileSize) {
+            if ((x / tileSize + y / tileSize) % 2 === 0) {
+              ctx.fillRect(x, y, tileSize, tileSize);
+            }
           }
         }
       }
-    }
 
-    // Set up DPR transform for drawing user content
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      // Set up DPR transform for drawing user content
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Draw image and strokes to a temporary canvas, then mask and composite onto background
     const maskToUse = stencilMaskRef.current || stencilRef.current;
     if (img && imageMeta && maskToUse) {
+      // Guard: ensure image is fully loaded
+      if (!img.complete || img.naturalWidth === 0 || img.naturalHeight === 0) {
+        return;
+      }
+      
+      // Guard: ensure mask is valid (for images, check if loaded; for canvas, check if valid)
+      const isMaskImage = maskToUse instanceof HTMLImageElement;
+      const isMaskCanvas = maskToUse instanceof HTMLCanvasElement;
+      if (isMaskImage && (!maskToUse.complete || maskToUse.naturalWidth === 0 || maskToUse.naturalHeight === 0)) {
+        return;
+      }
+      if (isMaskCanvas && (maskToUse.width === 0 || maskToUse.height === 0)) {
+        return;
+      }
+      
       // Create temporary canvas for image and strokes
-      const tempCanvas = document.createElement("canvas");
-      tempCanvas.width = Math.floor(size.w * dpr);
-      tempCanvas.height = Math.floor(size.h * dpr);
-      const tempCtx = tempCanvas.getContext("2d");
-      if (tempCtx) {
+      try {
+        const tempCanvas = document.createElement("canvas");
+        const tempWidth = Math.floor(size.w * dpr);
+        const tempHeight = Math.floor(size.h * dpr);
+        
+        // Guard: ensure temp canvas dimensions are valid
+        if (tempWidth <= 0 || tempHeight <= 0 || !Number.isFinite(tempWidth) || !Number.isFinite(tempHeight)) {
+          return;
+        }
+        
+        tempCanvas.width = tempWidth;
+        tempCanvas.height = tempHeight;
+        const tempCtx = tempCanvas.getContext("2d");
+        if (tempCtx) {
         tempCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
         // Draw image
         const cover = Math.max(size.w / imageMeta.width, size.h / imageMeta.height);
-        const baseScale = cover * imageTransform.scale;
+        // Guard: ensure transform values are valid
+        const scale = Number.isFinite(imageTransform.scale) ? imageTransform.scale : 1;
+        const offsetX = Number.isFinite(imageTransform.offsetX) ? imageTransform.offsetX : 0;
+        const offsetY = Number.isFinite(imageTransform.offsetY) ? imageTransform.offsetY : 0;
+        const baseScale = cover * scale;
+        if (!Number.isFinite(baseScale)) return;
+        
         tempCtx.save();
-        tempCtx.translate(size.w / 2 + imageTransform.offsetX, size.h / 2 + imageTransform.offsetY);
+        tempCtx.translate(size.w / 2 + offsetX, size.h / 2 + offsetY);
         tempCtx.scale(baseScale, baseScale);
         tempCtx.drawImage(img, -imageMeta.width / 2, -imageMeta.height / 2);
         tempCtx.restore();
@@ -234,13 +303,27 @@ export default function Home() {
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.drawImage(tempCanvas, 0, 0);
         ctx.restore();
+        }
+      } catch (error) {
+        console.error("Error drawing to temporary canvas:", error);
+        return;
       }
     } else if (img && imageMeta) {
+      // Guard: ensure image is fully loaded
+      if (!img.complete || img.naturalWidth === 0 || img.naturalHeight === 0) {
+        return;
+      }
       // Fallback if no mask: draw image and strokes normally
       const cover = Math.max(size.w / imageMeta.width, size.h / imageMeta.height);
-      const baseScale = cover * imageTransform.scale;
+      // Guard: ensure transform values are valid
+      const scale = Number.isFinite(imageTransform.scale) ? imageTransform.scale : 1;
+      const offsetX = Number.isFinite(imageTransform.offsetX) ? imageTransform.offsetX : 0;
+      const offsetY = Number.isFinite(imageTransform.offsetY) ? imageTransform.offsetY : 0;
+      const baseScale = cover * scale;
+      if (!Number.isFinite(baseScale)) return;
+      
       ctx.save();
-      ctx.translate(size.w / 2 + imageTransform.offsetX, size.h / 2 + imageTransform.offsetY);
+      ctx.translate(size.w / 2 + offsetX, size.h / 2 + offsetY);
       ctx.scale(baseScale, baseScale);
       ctx.drawImage(img, -imageMeta.width / 2, -imageMeta.height / 2);
       ctx.restore();
@@ -260,6 +343,10 @@ export default function Home() {
         ctx.stroke();
       }
     }
+    } catch (error) {
+      console.error("Error in redraw function:", error);
+      // Don't throw - just log the error to prevent app crash
+    }
   }
 
   useEffect(() => {
@@ -274,9 +361,17 @@ export default function Home() {
     const img = new Image();
     img.decoding = "async";
     img.onload = () => {
-      imageRef.current = img;
-      setImageMeta({ width: img.naturalWidth, height: img.naturalHeight });
-      setImageTransform({ scale: 1, offsetX: 0, offsetY: 0 });
+      // Guard: ensure image loaded successfully
+      if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+        imageRef.current = img;
+        setImageMeta({ width: img.naturalWidth, height: img.naturalHeight });
+        setImageTransform({ scale: 1, offsetX: 0, offsetY: 0 });
+      }
+    };
+    img.onerror = () => {
+      console.error("Failed to load image");
+      imageRef.current = null;
+      setImageMeta(null);
     };
     img.src = imageUrl;
   }, [imageUrl]);
@@ -371,46 +466,93 @@ export default function Home() {
   // Stage is fixed to stencil's natural pixel size: no window resize handlers.
 
   useEffect(() => {
-    redraw();
+    if (mounted) {
+      redraw();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stageSize, imageMeta, imageUrl, imageTransform, exportBackgroundType, exportBackgroundColor]);
+  }, [mounted, stageSize, imageMeta, imageUrl, imageTransform, exportBackgroundType, exportBackgroundColor]);
 
   function canvasPointFromEvent(e: React.PointerEvent<HTMLCanvasElement>) {
     const canvas = canvasRef.current;
     const size = stageSize;
     if (!canvas || !size) return null;
 
-    const rect = canvas.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width;
-    const y = (e.clientY - rect.top) / rect.height;
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    try {
+      const rect = canvas.getBoundingClientRect();
+      // Guard: ensure rect is valid
+      if (!rect || rect.width <= 0 || rect.height <= 0 || !Number.isFinite(rect.width) || !Number.isFinite(rect.height)) {
+        return null;
+      }
+      
+      // Guard: ensure clientX/Y are valid
+      if (!Number.isFinite(e.clientX) || !Number.isFinite(e.clientY)) {
+        return null;
+      }
+      
+      const x = (e.clientX - rect.left) / rect.width;
+      const y = (e.clientY - rect.top) / rect.height;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
 
-    return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+      return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+    } catch (error) {
+      console.error("Error in canvasPointFromEvent:", error);
+      return null;
+    }
   }
 
   function onCanvasPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
-    if (!imageUrl || !stageSize) return;
-    const p = canvasPointFromEvent(e);
-    if (!p) return;
+    try {
+      if (!imageUrl || !stageSize) return;
+      
+      // Guard: ensure stageSize is valid
+      if (stageSize.w <= 0 || !Number.isFinite(stageSize.w)) return;
+      
+      const p = canvasPointFromEvent(e);
+      if (!p) return;
 
-    const sizeNorm = brushSize / stageSize.w;
-    const stroke: Stroke = { color: brushColor, sizeNorm, points: [p] };
-    activeStrokeRef.current = stroke;
-    strokesRef.current = [...strokesRef.current, stroke];
-    isDrawingRef.current = true;
+      const sizeNorm = brushSize / stageSize.w;
+      if (!Number.isFinite(sizeNorm)) return;
+      
+      const stroke: Stroke = { color: brushColor, sizeNorm, points: [p] };
+      activeStrokeRef.current = stroke;
+      strokesRef.current = [...strokesRef.current, stroke];
+      isDrawingRef.current = true;
 
-    e.currentTarget.setPointerCapture(e.pointerId);
-    redraw();
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch (error) {
+        // Pointer capture may fail on some mobile browsers, continue anyway
+        console.warn("Pointer capture failed:", error);
+      }
+      
+      redraw();
+    } catch (error) {
+      console.error("Error in onCanvasPointerDown:", error);
+    }
   }
 
   function onCanvasPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
-    if (!isDrawingRef.current) return;
-    const p = canvasPointFromEvent(e);
-    const stroke = activeStrokeRef.current;
-    if (!p || !stroke) return;
+    try {
+      if (!isDrawingRef.current) return;
+      const p = canvasPointFromEvent(e);
+      const stroke = activeStrokeRef.current;
+      if (!p || !stroke) return;
 
-    stroke.points.push(p);
-    redraw();
+      // Guard: ensure point is valid
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+
+      stroke.points.push(p);
+      
+      // Throttle redraws using requestAnimationFrame
+      if (redrawRequestRef.current === null) {
+        redrawRequestRef.current = requestAnimationFrame(() => {
+          redrawRequestRef.current = null;
+          redraw();
+        });
+      }
+    } catch (error) {
+      console.error("Error in onCanvasPointerMove:", error);
+    }
   }
 
   function endDrawing(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -531,22 +673,9 @@ export default function Home() {
       ctx.restore();
     }
 
-    // Helper function to detect if device is mobile
-    function isMobileDevice(): boolean {
-      // Check for touch support and screen width
-      const hasTouchScreen = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-      const isSmallScreen = window.innerWidth <= 768;
+    exportCanvas.toBlob((blob) => {
+      if (!blob) return;
       
-      // Check user agent for mobile patterns
-      const userAgent = navigator.userAgent || navigator.vendor || '';
-      const mobileRegex = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i;
-      const isMobileUserAgent = mobileRegex.test(userAgent);
-      
-      return (hasTouchScreen && isSmallScreen) || isMobileUserAgent;
-    }
-
-    // Helper function to download image (fallback when Web Share API is not available)
-    function downloadImage(blob: Blob) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -555,41 +684,6 @@ export default function Home() {
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-    }
-
-    exportCanvas.toBlob((blob) => {
-      if (!blob) return;
-      
-      // Only use Web Share API on mobile devices
-      const isMobile = isMobileDevice();
-      
-      if (isMobile && navigator.share && navigator.canShare) {
-        // Convert blob to File for Web Share API
-        const file = new File([blob], "stealie-image.png", { type: "image/png" });
-        
-        // Try Web Share API on mobile (allows "Save to Photos" option)
-        if (navigator.canShare({ files: [file] })) {
-          navigator.share({
-            files: [file],
-            title: "Stealie",
-            text: "Check out my stealie!",
-          })
-            .then(() => {
-              // Share successful - user chose an option from share sheet
-            })
-            .catch((error) => {
-              // User cancelled or share failed - fall back to download
-              if (error.name !== "AbortError") {
-                // Only fall back if it wasn't a user cancellation
-                downloadImage(blob);
-              }
-            });
-          return;
-        }
-      }
-      
-      // Desktop or Web Share API not available - use download
-      downloadImage(blob);
     }, "image/png");
   }
 
@@ -803,33 +897,63 @@ export default function Home() {
                     ref={canvasRef}
                     className="absolute inset-0 h-full w-full touch-none"
                     onPointerDown={(e) => {
-                      if (editMode === "draw") {
-                        onCanvasPointerDown(e);
-                        return;
-                      }
-                      if (editMode !== "move") return;
-                      if (!stageSize) return;
+                      try {
+                        if (editMode === "draw") {
+                          onCanvasPointerDown(e);
+                          return;
+                        }
+                        if (editMode !== "move") return;
+                        if (!stageSize) return;
 
-                      e.currentTarget.setPointerCapture(e.pointerId);
-                      pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+                        // Guard: ensure clientX/Y are valid
+                        if (!Number.isFinite(e.clientX) || !Number.isFinite(e.clientY)) return;
+
+                        try {
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                        } catch (error) {
+                          // Pointer capture may fail on some mobile browsers, continue anyway
+                          console.warn("Pointer capture failed:", error);
+                        }
+                        pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
                       const pts = Array.from(pointersRef.current.values());
                       if (pts.length === 1) {
+                        const p = pts[0];
+                        // Guard: ensure point and transform values are valid
+                        if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+                        if (!Number.isFinite(imageTransform.scale) || 
+                            !Number.isFinite(imageTransform.offsetX) || 
+                            !Number.isFinite(imageTransform.offsetY)) return;
+                        
                         gestureRef.current = {
                           kind: "pan",
                           startScale: imageTransform.scale,
                           startOffsetX: imageTransform.offsetX,
                           startOffsetY: imageTransform.offsetY,
-                          startMidX: pts[0].x,
-                          startMidY: pts[0].y,
+                          startMidX: p.x,
+                          startMidY: p.y,
                           startDist: 0,
                         };
                       } else if (pts.length >= 2) {
                         const a = pts[0];
                         const b = pts[1];
+                        
+                        // Guard: ensure both points are valid
+                        if (!Number.isFinite(a.x) || !Number.isFinite(a.y) || 
+                            !Number.isFinite(b.x) || !Number.isFinite(b.y)) return;
+                        if (!Number.isFinite(imageTransform.scale) || 
+                            !Number.isFinite(imageTransform.offsetX) || 
+                            !Number.isFinite(imageTransform.offsetY)) return;
+                        
                         const midX = (a.x + b.x) / 2;
                         const midY = (a.y + b.y) / 2;
-                        const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+                        let dist = Math.hypot(a.x - b.x, a.y - b.y);
+                        
+                        // Guard: ensure distance is valid and not zero
+                        if (!Number.isFinite(dist) || dist <= 0) {
+                          dist = 1; // Fallback to prevent division by zero
+                        }
+                        
                         gestureRef.current = {
                           kind: "pinch",
                           startScale: imageTransform.scale,
@@ -840,70 +964,190 @@ export default function Home() {
                           startDist: dist,
                         };
                       }
+                      } catch (error) {
+                        console.error("Error in onPointerDown:", error);
+                      }
                     }}
                     onPointerMove={(e) => {
-                      if (editMode === "draw") {
-                        onCanvasPointerMove(e);
-                        return;
-                      }
-                      if (editMode !== "move") return;
-                      const g = gestureRef.current;
-                      if (!g) return;
+                      try {
+                        if (editMode === "draw") {
+                          onCanvasPointerMove(e);
+                          return;
+                        }
+                        if (editMode !== "move") return;
+                        const g = gestureRef.current;
+                        if (!g) return;
 
+                      // Guard: ensure clientX/Y are valid
+                      if (!Number.isFinite(e.clientX) || !Number.isFinite(e.clientY)) return;
+                      
                       pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
                       const pts = Array.from(pointersRef.current.values());
                       if (pts.length === 0) return;
 
                       if (pts.length === 1 && g.kind === "pan") {
                         const p = pts[0];
+                        // Guard: ensure point values are valid
+                        if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+                        if (!Number.isFinite(g.startMidX) || !Number.isFinite(g.startMidY)) return;
+                        
                         const dx = p.x - g.startMidX;
                         const dy = p.y - g.startMidY;
-                        setImageTransform({
+                        
+                        // Guard: ensure calculations are valid
+                        if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+                        if (!Number.isFinite(g.startScale)) return;
+                        
+                        const newOffsetX = g.startOffsetX + dx;
+                        const newOffsetY = g.startOffsetY + dy;
+                        
+                        // Guard: ensure offset values are reasonable (prevent extreme values)
+                        if (!Number.isFinite(newOffsetX) || !Number.isFinite(newOffsetY)) return;
+                        if (Math.abs(newOffsetX) > 10000 || Math.abs(newOffsetY) > 10000) return;
+                        
+                        // Store pending transform and throttle state updates
+                        pendingTransformRef.current = {
                           scale: g.startScale,
-                          offsetX: g.startOffsetX + dx,
-                          offsetY: g.startOffsetY + dy,
-                        });
+                          offsetX: newOffsetX,
+                          offsetY: newOffsetY,
+                        };
+                        
+                        // Throttle state updates using requestAnimationFrame
+                        if (transformUpdateRequestRef.current === null) {
+                          transformUpdateRequestRef.current = requestAnimationFrame(() => {
+                            if (pendingTransformRef.current) {
+                              setImageTransform(pendingTransformRef.current);
+                              pendingTransformRef.current = null;
+                            }
+                            transformUpdateRequestRef.current = null;
+                          });
+                        }
                         return;
                       }
 
                       if (pts.length >= 2) {
                         const a = pts[0];
                         const b = pts[1];
+                        
+                        // Guard: ensure both points are valid
+                        if (!Number.isFinite(a.x) || !Number.isFinite(a.y) || 
+                            !Number.isFinite(b.x) || !Number.isFinite(b.y)) return;
+                        
                         const midX = (a.x + b.x) / 2;
                         const midY = (a.y + b.y) / 2;
-                        const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+                        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+                        
+                        // Guard: prevent division by zero and ensure values are valid
+                        if (!Number.isFinite(dist) || dist <= 0) return;
+                        if (!Number.isFinite(g.startDist) || g.startDist <= 0) return;
+                        if (!Number.isFinite(g.startScale)) return;
+                        
+                        const scaleRatio = dist / g.startDist;
+                        if (!Number.isFinite(scaleRatio)) return;
+                        
                         const scale = Math.min(
                           6,
-                          Math.max(0.2, g.startScale * (dist / g.startDist)),
+                          Math.max(0.2, g.startScale * scaleRatio),
                         );
                         const dx = midX - g.startMidX;
                         const dy = midY - g.startMidY;
-                        setImageTransform({
+                        
+                        // Guard: ensure final values are valid
+                        if (!Number.isFinite(scale) || !Number.isFinite(dx) || !Number.isFinite(dy)) return;
+                        
+                        const newOffsetX = g.startOffsetX + dx;
+                        const newOffsetY = g.startOffsetY + dy;
+                        
+                        // Guard: ensure offset values are reasonable (prevent extreme values)
+                        if (!Number.isFinite(newOffsetX) || !Number.isFinite(newOffsetY)) return;
+                        if (Math.abs(newOffsetX) > 10000 || Math.abs(newOffsetY) > 10000) return;
+                        
+                        // Store pending transform and throttle state updates
+                        pendingTransformRef.current = {
                           scale,
-                          offsetX: g.startOffsetX + dx,
-                          offsetY: g.startOffsetY + dy,
-                        });
+                          offsetX: newOffsetX,
+                          offsetY: newOffsetY,
+                        };
+                        
+                        // Throttle state updates using requestAnimationFrame
+                        if (transformUpdateRequestRef.current === null) {
+                          transformUpdateRequestRef.current = requestAnimationFrame(() => {
+                            if (pendingTransformRef.current) {
+                              setImageTransform(pendingTransformRef.current);
+                              pendingTransformRef.current = null;
+                            }
+                            transformUpdateRequestRef.current = null;
+                          });
+                        }
+                      }
+                      } catch (error) {
+                        console.error("Error in onPointerMove:", error);
                       }
                     }}
                     onPointerUp={(e) => {
-                      endDrawing(e);
-                      pointersRef.current.delete(e.pointerId);
-                      gestureRef.current = null;
                       try {
-                        e.currentTarget.releasePointerCapture(e.pointerId);
-                      } catch {
-                        // ignore
+                        endDrawing(e);
+                        pointersRef.current.delete(e.pointerId);
+                        
+                        // Flush any pending transform update before clearing gesture
+                        if (pendingTransformRef.current) {
+                          setImageTransform(pendingTransformRef.current);
+                          pendingTransformRef.current = null;
+                        }
+                        if (transformUpdateRequestRef.current !== null) {
+                          cancelAnimationFrame(transformUpdateRequestRef.current);
+                          transformUpdateRequestRef.current = null;
+                        }
+                        
+                        gestureRef.current = null;
+                        try {
+                          e.currentTarget.releasePointerCapture(e.pointerId);
+                        } catch {
+                          // ignore
+                        }
+                      } catch (error) {
+                        console.error("Error in onPointerUp:", error);
                       }
                     }}
                     onPointerCancel={(e) => {
-                      endDrawing(e);
-                      pointersRef.current.delete(e.pointerId);
-                      gestureRef.current = null;
+                      try {
+                        endDrawing(e);
+                        pointersRef.current.delete(e.pointerId);
+                        
+                        // Flush any pending transform update before clearing gesture
+                        if (pendingTransformRef.current) {
+                          setImageTransform(pendingTransformRef.current);
+                          pendingTransformRef.current = null;
+                        }
+                        if (transformUpdateRequestRef.current !== null) {
+                          cancelAnimationFrame(transformUpdateRequestRef.current);
+                          transformUpdateRequestRef.current = null;
+                        }
+                        
+                        gestureRef.current = null;
+                      } catch (error) {
+                        console.error("Error in onPointerCancel:", error);
+                      }
                     }}
                     onPointerLeave={(e) => {
-                      endDrawing(e);
-                      pointersRef.current.delete(e.pointerId);
-                      gestureRef.current = null;
+                      try {
+                        endDrawing(e);
+                        pointersRef.current.delete(e.pointerId);
+                        
+                        // Flush any pending transform update before clearing gesture
+                        if (pendingTransformRef.current) {
+                          setImageTransform(pendingTransformRef.current);
+                          pendingTransformRef.current = null;
+                        }
+                        if (transformUpdateRequestRef.current !== null) {
+                          cancelAnimationFrame(transformUpdateRequestRef.current);
+                          transformUpdateRequestRef.current = null;
+                        }
+                        
+                        gestureRef.current = null;
+                      } catch (error) {
+                        console.error("Error in onPointerLeave:", error);
+                      }
                     }}
                     onWheel={(e) => {
                       if (editMode !== "move") return;
