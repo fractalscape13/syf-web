@@ -21,6 +21,9 @@ export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const stencilRef = useRef<HTMLImageElement | null>(null);
+  const processedStencilRef = useRef<HTMLCanvasElement | null>(null);
+  const stencilMaskRef = useRef<HTMLCanvasElement | null>(null);
+  const [processedStencilUrl, setProcessedStencilUrl] = useState<string | null>(null);
   const strokesRef = useRef<Stroke[]>([]);
   const isDrawingRef = useRef(false);
   const activeStrokeRef = useRef<Stroke | null>(null);
@@ -55,6 +58,8 @@ export default function Home() {
   const [brushColor, setBrushColor] = useState("#111827");
   const [brushSize, setBrushSize] = useState(10);
   const [editMode, setEditMode] = useState<"move" | "draw">("move");
+  const [exportBackgroundType, setExportBackgroundType] = useState<"color" | "transparent">("color");
+  const [exportBackgroundColor, setExportBackgroundColor] = useState("#D9D9D9");
   const [imageTransform, setImageTransform] = useState<{
     scale: number;
     offsetX: number;
@@ -67,8 +72,9 @@ export default function Home() {
   useEffect(() => {
     return () => {
       if (imageUrl) URL.revokeObjectURL(imageUrl);
+      if (processedStencilUrl) URL.revokeObjectURL(processedStencilUrl);
     };
-  }, [imageUrl]);
+  }, [imageUrl, processedStencilUrl]);
 
   function pickImage() {
     inputRef.current?.click();
@@ -97,7 +103,7 @@ export default function Home() {
       stencilMeta &&
       strokesRef.current &&
       imageRef.current &&
-      stencilRef.current
+      (stencilRef.current || processedStencilRef.current)
   );
 
   const exportDisabledReason = useMemo(() => {
@@ -152,34 +158,107 @@ export default function Home() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, size.w, size.h);
+    // Reset transform and clear
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    
+    // Draw background first (before any transforms)
+    if (exportBackgroundType === "color") {
+      ctx.fillStyle = exportBackgroundColor;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    } else {
+      // Transparent - draw checkerboard pattern to indicate transparency
+      // Draw checkerboard at device pixel resolution
+      const tileSize = 12 * dpr;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#e5e5e5";
+      for (let y = 0; y < canvas.height; y += tileSize) {
+        for (let x = 0; x < canvas.width; x += tileSize) {
+          if ((x / tileSize + y / tileSize) % 2 === 0) {
+            ctx.fillRect(x, y, tileSize, tileSize);
+          }
+        }
+      }
+    }
 
-    if (img && imageMeta) {
+    // Set up DPR transform for drawing user content
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Draw image and strokes to a temporary canvas, then mask and composite onto background
+    const maskToUse = stencilMaskRef.current || stencilRef.current;
+    if (img && imageMeta && maskToUse) {
+      // Create temporary canvas for image and strokes
+      const tempCanvas = document.createElement("canvas");
+      tempCanvas.width = Math.floor(size.w * dpr);
+      tempCanvas.height = Math.floor(size.h * dpr);
+      const tempCtx = tempCanvas.getContext("2d");
+      if (tempCtx) {
+        tempCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        // Draw image
+        const cover = Math.max(size.w / imageMeta.width, size.h / imageMeta.height);
+        const baseScale = cover * imageTransform.scale;
+        tempCtx.save();
+        tempCtx.translate(size.w / 2 + imageTransform.offsetX, size.h / 2 + imageTransform.offsetY);
+        tempCtx.scale(baseScale, baseScale);
+        tempCtx.drawImage(img, -imageMeta.width / 2, -imageMeta.height / 2);
+        tempCtx.restore();
+
+        // Draw strokes
+        tempCtx.lineCap = "round";
+        tempCtx.lineJoin = "round";
+        for (const stroke of strokesRef.current) {
+          if (stroke.points.length < 2) continue;
+          tempCtx.strokeStyle = stroke.color;
+          tempCtx.lineWidth = Math.max(1, stroke.sizeNorm * size.w);
+          tempCtx.beginPath();
+          tempCtx.moveTo(stroke.points[0].x * size.w, stroke.points[0].y * size.h);
+          for (let i = 1; i < stroke.points.length; i++) {
+            const p = stroke.points[i];
+            tempCtx.lineTo(p.x * size.w, p.y * size.h);
+          }
+          tempCtx.stroke();
+        }
+
+        // Mask the temporary canvas to only show inside stencil
+        tempCtx.save();
+        tempCtx.globalCompositeOperation = "destination-in";
+        // Draw mask at device pixel resolution
+        tempCtx.setTransform(1, 0, 0, 1, 0, 0);
+        // Scale mask to match temp canvas size (which is already at DPR resolution)
+        tempCtx.drawImage(maskToUse, 0, 0, tempCanvas.width, tempCanvas.height);
+        tempCtx.restore();
+
+        // Composite the masked image/strokes onto the main canvas
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(tempCanvas, 0, 0);
+        ctx.restore();
+      }
+    } else if (img && imageMeta) {
+      // Fallback if no mask: draw image and strokes normally
       const cover = Math.max(size.w / imageMeta.width, size.h / imageMeta.height);
       const baseScale = cover * imageTransform.scale;
-
       ctx.save();
       ctx.translate(size.w / 2 + imageTransform.offsetX, size.h / 2 + imageTransform.offsetY);
       ctx.scale(baseScale, baseScale);
       ctx.drawImage(img, -imageMeta.width / 2, -imageMeta.height / 2);
       ctx.restore();
-    }
 
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-
-    for (const stroke of strokesRef.current) {
-      if (stroke.points.length < 2) continue;
-      ctx.strokeStyle = stroke.color;
-      ctx.lineWidth = Math.max(1, stroke.sizeNorm * size.w);
-      ctx.beginPath();
-      ctx.moveTo(stroke.points[0].x * size.w, stroke.points[0].y * size.h);
-      for (let i = 1; i < stroke.points.length; i++) {
-        const p = stroke.points[i];
-        ctx.lineTo(p.x * size.w, p.y * size.h);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      for (const stroke of strokesRef.current) {
+        if (stroke.points.length < 2) continue;
+        ctx.strokeStyle = stroke.color;
+        ctx.lineWidth = Math.max(1, stroke.sizeNorm * size.w);
+        ctx.beginPath();
+        ctx.moveTo(stroke.points[0].x * size.w, stroke.points[0].y * size.h);
+        for (let i = 1; i < stroke.points.length; i++) {
+          const p = stroke.points[i];
+          ctx.lineTo(p.x * size.w, p.y * size.h);
+        }
+        ctx.stroke();
       }
-      ctx.stroke();
     }
   }
 
@@ -210,6 +289,74 @@ export default function Home() {
       stencilRef.current = img;
       const meta = { width: img.naturalWidth, height: img.naturalHeight };
       setStencilMeta(meta);
+
+      // Process stencil to make grey background transparent
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imageData.data;
+
+        // Make grey background transparent (approximately #D9D9D9 or similar grey)
+        // Check for pixels that are close to grey (similar R, G, B values)
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          // Check if pixel is grey (R, G, B are similar) and in the grey range
+          const isGrey = Math.abs(r - g) < 30 && Math.abs(g - b) < 30 && Math.abs(r - b) < 30;
+          const greyValue = (r + g + b) / 3;
+          // If it's a light grey (between ~200-230), make it transparent
+          if (isGrey && greyValue > 200 && greyValue < 240) {
+            data[i + 3] = 0; // Set alpha to 0 (transparent)
+          }
+        }
+        ctx.putImageData(imageData, 0, 0);
+        processedStencilRef.current = canvas;
+        // Create data URL for the overlay image
+        canvas.toBlob((blob) => {
+          if (blob) {
+            const url = URL.createObjectURL(blob);
+            setProcessedStencilUrl(url);
+          }
+        }, "image/png");
+
+        // Create a mask for clipping: black parts = opaque, grey parts = transparent
+        const maskCanvas = document.createElement("canvas");
+        maskCanvas.width = img.naturalWidth;
+        maskCanvas.height = img.naturalHeight;
+        const maskCtx = maskCanvas.getContext("2d");
+        if (maskCtx) {
+          maskCtx.drawImage(img, 0, 0);
+          const maskImageData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+          const maskData = maskImageData.data;
+
+          for (let i = 0; i < maskData.length; i += 4) {
+            const r = maskData[i];
+            const g = maskData[i + 1];
+            const b = maskData[i + 2];
+            // Check if pixel is grey (similar R, G, B values)
+            const isGrey = Math.abs(r - g) < 30 && Math.abs(g - b) < 30 && Math.abs(r - b) < 30;
+            const greyValue = (r + g + b) / 3;
+            // If it's a light grey (background), make it transparent
+            // Otherwise (black parts), make it fully opaque white for the mask
+            if (isGrey && greyValue > 200 && greyValue < 240) {
+              maskData[i + 3] = 0; // Transparent
+            } else {
+              // Black parts: make fully opaque (white in mask means "keep")
+              maskData[i] = 255;
+              maskData[i + 1] = 255;
+              maskData[i + 2] = 255;
+              maskData[i + 3] = 255;
+            }
+          }
+          maskCtx.putImageData(maskImageData, 0, 0);
+          stencilMaskRef.current = maskCanvas;
+        }
+      }
     };
     img.onerror = (e) => {
       console.error("Failed to load stencil image. Path:", stencilPath, "Error:", e);
@@ -226,7 +373,7 @@ export default function Home() {
   useEffect(() => {
     redraw();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stageSize, imageMeta, imageUrl, imageTransform]);
+  }, [stageSize, imageMeta, imageUrl, imageTransform, exportBackgroundType, exportBackgroundColor]);
 
   function canvasPointFromEvent(e: React.PointerEvent<HTMLCanvasElement>) {
     const canvas = canvasRef.current;
@@ -283,7 +430,8 @@ export default function Home() {
   }
 
   function exportImage() {
-    if (!imageUrl || !imageMeta || !imageRef.current || !stencilRef.current || !stageSize) return;
+    if (!imageUrl || !imageMeta || !imageRef.current || !stageSize) return;
+    if (!stencilRef.current && !processedStencilRef.current) return;
 
     const exportCanvas = document.createElement("canvas");
     exportCanvas.width = stageSize.w;
@@ -291,35 +439,97 @@ export default function Home() {
     const ctx = exportCanvas.getContext("2d");
     if (!ctx) return;
 
-    const cover = Math.max(stageSize.w / imageMeta.width, stageSize.h / imageMeta.height);
-    const baseScale = cover * imageTransform.scale;
-    ctx.save();
-    ctx.translate(stageSize.w / 2 + imageTransform.offsetX, stageSize.h / 2 + imageTransform.offsetY);
-    ctx.scale(baseScale, baseScale);
-    ctx.drawImage(imageRef.current, -imageMeta.width / 2, -imageMeta.height / 2);
-    ctx.restore();
+    // Draw background
+    if (exportBackgroundType === "color") {
+      ctx.fillStyle = exportBackgroundColor;
+      ctx.fillRect(0, 0, stageSize.w, stageSize.h);
+    }
+    // If transparent, leave canvas transparent (no fill)
 
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
+    // Draw image and strokes to a temporary canvas, then mask and composite onto background
+    const maskToUse = stencilMaskRef.current || stencilRef.current;
+    if (maskToUse) {
+      // Create temporary canvas for image and strokes
+      const tempCanvas = document.createElement("canvas");
+      tempCanvas.width = stageSize.w;
+      tempCanvas.height = stageSize.h;
+      const tempCtx = tempCanvas.getContext("2d");
+      if (tempCtx) {
+        // Draw image
+        const cover = Math.max(stageSize.w / imageMeta.width, stageSize.h / imageMeta.height);
+        const baseScale = cover * imageTransform.scale;
+        tempCtx.save();
+        tempCtx.translate(stageSize.w / 2 + imageTransform.offsetX, stageSize.h / 2 + imageTransform.offsetY);
+        tempCtx.scale(baseScale, baseScale);
+        tempCtx.drawImage(imageRef.current, -imageMeta.width / 2, -imageMeta.height / 2);
+        tempCtx.restore();
 
-    for (const stroke of strokesRef.current) {
-      if (stroke.points.length < 2) continue;
-      ctx.strokeStyle = stroke.color;
-      ctx.lineWidth = Math.max(1, stroke.sizeNorm * stageSize.w);
-      ctx.beginPath();
-      ctx.moveTo(
-        stroke.points[0].x * stageSize.w,
-        stroke.points[0].y * stageSize.h
-      );
-      for (let i = 1; i < stroke.points.length; i++) {
-        const p = stroke.points[i];
-        ctx.lineTo(p.x * stageSize.w, p.y * stageSize.h);
+        // Draw strokes
+        tempCtx.lineCap = "round";
+        tempCtx.lineJoin = "round";
+        for (const stroke of strokesRef.current) {
+          if (stroke.points.length < 2) continue;
+          tempCtx.strokeStyle = stroke.color;
+          tempCtx.lineWidth = Math.max(1, stroke.sizeNorm * stageSize.w);
+          tempCtx.beginPath();
+          tempCtx.moveTo(
+            stroke.points[0].x * stageSize.w,
+            stroke.points[0].y * stageSize.h
+          );
+          for (let i = 1; i < stroke.points.length; i++) {
+            const p = stroke.points[i];
+            tempCtx.lineTo(p.x * stageSize.w, p.y * stageSize.h);
+          }
+          tempCtx.stroke();
+        }
+
+        // Mask the temporary canvas to only show inside stencil
+        tempCtx.save();
+        tempCtx.globalCompositeOperation = "destination-in";
+        tempCtx.drawImage(maskToUse, 0, 0, stageSize.w, stageSize.h);
+        tempCtx.restore();
+
+        // Composite the masked image/strokes onto the main canvas (with background)
+        ctx.drawImage(tempCanvas, 0, 0);
       }
-      ctx.stroke();
+    } else {
+      // Fallback if no mask: draw image and strokes normally
+      const cover = Math.max(stageSize.w / imageMeta.width, stageSize.h / imageMeta.height);
+      const baseScale = cover * imageTransform.scale;
+      ctx.save();
+      ctx.translate(stageSize.w / 2 + imageTransform.offsetX, stageSize.h / 2 + imageTransform.offsetY);
+      ctx.scale(baseScale, baseScale);
+      ctx.drawImage(imageRef.current, -imageMeta.width / 2, -imageMeta.height / 2);
+      ctx.restore();
+
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      for (const stroke of strokesRef.current) {
+        if (stroke.points.length < 2) continue;
+        ctx.strokeStyle = stroke.color;
+        ctx.lineWidth = Math.max(1, stroke.sizeNorm * stageSize.w);
+        ctx.beginPath();
+        ctx.moveTo(
+          stroke.points[0].x * stageSize.w,
+          stroke.points[0].y * stageSize.h
+        );
+        for (let i = 1; i < stroke.points.length; i++) {
+          const p = stroke.points[i];
+          ctx.lineTo(p.x * stageSize.w, p.y * stageSize.h);
+        }
+        ctx.stroke();
+      }
     }
 
-    // Match the on-screen overlay: draw stencil last so it's on top.
-    ctx.drawImage(stencilRef.current, 0, 0, stageSize.w, stageSize.h);
+    // Draw stencil outline on top (the black lines of the skull)
+    // Use processed stencil so background shows through, or original if processed not available
+    const stencilToDraw = processedStencilRef.current || stencilRef.current;
+    if (stencilToDraw) {
+      ctx.save();
+      ctx.globalCompositeOperation = "source-over";
+      ctx.drawImage(stencilToDraw, 0, 0, stageSize.w, stageSize.h);
+      ctx.restore();
+    }
 
     exportCanvas.toBlob((blob) => {
       if (!blob) return;
@@ -349,24 +559,69 @@ export default function Home() {
           onChange={onFileChange}
         />
 
-        <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={pickImage}
-            className="rounded-full bg-black px-5 py-2.5 text-sm font-semibold text-white shadow-sm ring-1 ring-black/10 transition hover:bg-black/90 active:translate-y-px"
-          >
-            {imageUrl ? "Change image" : "Choose image"}
-          </button>
+        <div className="flex flex-col items-center gap-3">
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={pickImage}
+              className="rounded-full bg-black px-5 py-2.5 text-sm font-semibold text-white shadow-sm ring-1 ring-black/10 transition hover:bg-black/90 active:translate-y-px"
+            >
+              {imageUrl ? "Change image" : "Choose image"}
+            </button>
 
-          <button
-            type="button"
-            onClick={exportImage}
-            disabled={!canExport}
-            title={!canExport ? exportDisabledReason : "Download edited image"}
-            className="rounded-full bg-transparent px-5 py-2.5 text-sm font-semibold text-black ring-1 ring-black/20 transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-40 active:translate-y-px"
-          >
-            Export image
-          </button>
+            <button
+              type="button"
+              onClick={exportImage}
+              disabled={!canExport}
+              title={!canExport ? exportDisabledReason : "Download edited image"}
+              className="rounded-full bg-transparent px-5 py-2.5 text-sm font-semibold text-black ring-1 ring-black/20 transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-40 active:translate-y-px"
+            >
+              Export image
+            </button>
+          </div>
+
+          {imageUrl && (
+            <div className="flex items-center gap-2 rounded-full px-2 py-1.5 ring-1 ring-black/20">
+              <span className="px-2 text-xs font-semibold text-black/70">Background:</span>
+              <div className="flex items-center rounded-full ring-1 ring-black/10">
+                <button
+                  type="button"
+                  onClick={() => setExportBackgroundType("color")}
+                  className={[
+                    "rounded-full px-3 py-1.5 text-xs font-semibold transition",
+                    exportBackgroundType === "color"
+                      ? "bg-black text-white"
+                      : "text-black/70 hover:bg-black/5",
+                  ].join(" ")}
+                >
+                  Color
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExportBackgroundType("transparent")}
+                  className={[
+                    "rounded-full px-3 py-1.5 text-xs font-semibold transition",
+                    exportBackgroundType === "transparent"
+                      ? "bg-black text-white"
+                      : "text-black/70 hover:bg-black/5",
+                  ].join(" ")}
+                >
+                  Transparent
+                </button>
+              </div>
+              {exportBackgroundType === "color" && (
+                <label className="flex items-center gap-1.5">
+                  <input
+                    type="color"
+                    value={exportBackgroundColor}
+                    onChange={(e) => setExportBackgroundColor(e.target.value)}
+                    className="h-7 w-9 rounded-md border border-black/20 bg-transparent p-0.5 cursor-pointer"
+                    title="Background color"
+                  />
+                </label>
+              )}
+            </div>
+          )}
         </div>
       </header>
 
@@ -497,7 +752,7 @@ export default function Home() {
                 {imageUrl ? (
                   <canvas
                     ref={canvasRef}
-                    className="absolute inset-0 h-full w-full touch-none bg-black/5"
+                    className="absolute inset-0 h-full w-full touch-none"
                     onPointerDown={(e) => {
                       if (editMode === "draw") {
                         onCanvasPointerDown(e);
@@ -626,7 +881,7 @@ export default function Home() {
 
                 {/* Stencil overlay */}
                 <img
-                  src={withBasePath("/images/stealie.png")}
+                  src={processedStencilUrl || withBasePath("/images/stealie.png")}
                   alt="Stealie stencil"
                   className="pointer-events-none absolute inset-0 h-full w-full select-none object-contain"
                   draggable={false}
